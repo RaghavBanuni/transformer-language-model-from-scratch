@@ -55,8 +55,9 @@ def test_targets_are_the_inputs_shifted_by_exactly_one():
 def test_batches_stay_inside_the_stream():
     """The window start is bounded so the shifted target never runs off the end."""
     dataset = Dataset(np.arange(30), train_fraction=1.0)
+    rng = np.random.default_rng(0)
     for _ in range(50):
-        x, y = dataset.batch(np.random.default_rng(None), 4, 8)
+        x, y = dataset.batch(rng, 4, 8)
         assert x.max() < 30 and y.max() < 30
 
 
@@ -144,19 +145,17 @@ def test_held_out_loss_is_recorded_and_also_beats_the_uniform_baseline():
 
 def test_learning_rate_follows_the_schedule():
     _, dataset = demo.demo_dataset()
-    model = small_model()
-    report = train(model, dataset, steps=40, batch_size=4, lr=1e-3, warmup_steps=10)
+    report = train(small_model(), dataset, steps=40, batch_size=4, lr=1e-3, warmup_steps=10)
 
-    assert report.learning_rates[0] == pytest.approx(1e-4)      # first warmup step
-    assert report.learning_rates[9] == pytest.approx(1e-3)      # peak at the end of warmup
-    assert report.learning_rates[-1] < report.learning_rates[9] # then decaying
+    assert report.learning_rates[0] == pytest.approx(1e-4)       # first warmup step
+    assert report.learning_rates[9] == pytest.approx(1e-3)       # peak at the end of warmup
+    assert report.learning_rates[-1] < report.learning_rates[9]  # then decaying
 
 
 def test_gradient_norms_are_recorded_before_clipping():
     """Logging the post-clip norm would report the threshold back to you, which tells you nothing."""
     _, dataset = demo.demo_dataset()
-    model = small_model()
-    report = train(model, dataset, steps=20, batch_size=4, lr=1e-3, max_grad_norm=1e-6)
+    report = train(small_model(), dataset, steps=20, batch_size=4, lr=1e-3, max_grad_norm=1e-6)
     assert max(report.grad_norms) > 1e-6
 
 
@@ -171,14 +170,12 @@ def test_dropout_is_disabled_during_evaluation_and_the_mode_restored():
     config = ModelConfig(vocab_size=256, block_size=16, n_layer=1, n_head=2, n_embd=32, dropout=0.3)
     model = TransformerLM(config, seed=0)
     _, dataset = demo.demo_dataset()
-    model.train()
+    assert model.training
 
-    rng = np.random.default_rng(0)
     first = evaluate(model, dataset, np.random.default_rng(0), batch_size=4, n_batches=2)
     second = evaluate(model, dataset, np.random.default_rng(0), batch_size=4, n_batches=2)
     assert first == pytest.approx(second)  # deterministic, so dropout was off
     assert model.training, "evaluate must hand the training mode back"
-    assert rng is not None
 
 
 def test_smoothing_is_a_trailing_mean():
