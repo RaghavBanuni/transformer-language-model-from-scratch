@@ -1,0 +1,6 @@
+# Runtime: NumPy alone. There is no deep-learning framework here on purpose -- every gradient in
+# this repository is derived by hand and checked against central finite differences.
+numpy>=1.24
+
+# Tests only.
+pytest>=7.4

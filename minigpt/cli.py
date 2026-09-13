@@ -1,7 +1,7 @@
 """Demonstrations. Each subcommand establishes one fact about the implementation.
 
 ``gradcheck``  every parameter's analytic gradient against central finite differences
-``causal``     that a future token cannot influence an earlier position's logits
+``causal``     that a future token cannot influence an earlier position's output
 ``init``       that the loss at initialisation equals ln(V), as it must
 ``overfit``    that the model can memorise one batch -- the sharpest correctness test there is
 ``optim``      AdamW's decoupled decay and scale invariance, as exact properties
@@ -22,11 +22,11 @@ import numpy as np
 
 from . import demo
 from .gradcheck import check_module
+from .layers import softmax
 from .model import ModelConfig, TransformerLM
 from .optim import AdamW, cosine_schedule_with_warmup
-from .sampling import generate, sample_from_logits, top_k_filter, top_p_filter
-from .tokenizer import BPETokenizer
-from .train import Dataset, initial_loss_report, overfit_batch, train, uniform_loss
+from .sampling import generate, top_k_filter, top_p_filter
+from .train import initial_loss_report, overfit_batch, train, uniform_loss
 
 RULE = "=" * 78
 
@@ -49,7 +49,7 @@ def cmd_gradcheck(args) -> None:
     for result in results:
         print(result)
 
-    worst = max(results, key=lambda r: r.max_relative_error)
+    worst = max(results, key=lambda result: result.max_relative_error)
     print(
         f"\nworst relative error {worst.max_relative_error:.3e} on {worst.name}\n"
         "Anything under 1e-6 means the derivation is right. Around 1e-2 means a missing term.\n"
@@ -77,15 +77,16 @@ def cmd_causal(args) -> None:
     print(f"  max logit change at positions 0..{last - 1}: {earlier:.3e}")
     print(f"  max logit change at position {last}:        {at_change:.3e}")
     print(
-        "\nThe first number is exactly zero, not merely small. That is what makes training on all\n"
-        "positions at once legitimate: each position is a genuine prediction of the next token\n"
+        "\nThe first number is exactly zero, not merely small: masked scores are -inf before the\n"
+        "softmax, so they contribute probability exactly 0. That is what makes training on all\n"
+        "positions at once legitimate -- each position is a genuine prediction of the next token\n"
         "rather than a lookup of it. A leaky mask shows up as a beautiful training loss and\n"
         "generation that falls apart, because at inference the future really is absent."
     )
 
-    mask_row_sums = np.tril(np.ones((5, 5))).sum(axis=1)
-    print(f"\nvisible positions per row for T=5: {mask_row_sums.astype(int).tolist()}")
-    print("Position 0 attends to itself alone, which is why its prediction is the prior.")
+    visible = np.tril(np.ones((5, 5))).sum(axis=1).astype(int).tolist()
+    print(f"\nvisible positions per row for T=5: {visible}")
+    print("Position 0 attends to itself alone, which is why its prediction is just the prior.")
 
 
 def cmd_init(args) -> None:
@@ -125,21 +126,25 @@ def cmd_overfit(args) -> None:
     print(
         "These are random token sequences with no structure whatsoever, so the only way to fit\n"
         "them is to memorise -- which is the point. A model that cannot memorise two sequences of\n"
-        "eight tokens has a bug, and no amount of data will fix it. Reaching a loss near zero\n"
-        "exercises the whole chain: attention, both norms, GELU, tied embeddings, AdamW."
+        "eight tokens has a bug, and no amount of data will fix it. Getting the loss to near zero\n"
+        "exercises the whole chain: attention, both norms, GELU, the tied embedding, AdamW."
     )
 
 
 def cmd_optim(args) -> None:
     """AdamW's two properties that distinguish it from Adam plus L2."""
     _heading("Decoupled weight decay: exact geometric shrinkage")
-    weights = {"W": np.array([[1.0, -2.0]])}
-    zero_grads = {"W": np.zeros((1, 2))}
+    start = np.array([[1.0, -2.0]])
+    weights = {"W": start.copy()}
+    zero_grads = {"W": np.zeros_like(start)}
     optimizer = AdamW(weights, lr=0.1, weight_decay=0.1)
     for step in range(4):
         optimizer.step(zero_grads)
-        expected = np.array([[1.0, -2.0]]) * (1.0 - 0.1 * 0.1) ** (step + 1)
-        print(f"  step {step + 1}: {weights['W'].round(6).tolist()}  expected {expected.round(6).tolist()}")
+        expected = start * (1.0 - 0.1 * 0.1) ** (step + 1)
+        print(
+            f"  step {step + 1}: {weights['W'].round(6).tolist()}  "
+            f"expected {expected.round(6).tolist()}"
+        )
     print(
         "\nWith zero gradients the update is exactly p*(1 - lr*wd)^t. Adam with L2 folded into the\n"
         "gradient cannot do this: the decay term would be divided by sqrt(v), so how strongly a\n"
@@ -150,8 +155,7 @@ def cmd_optim(args) -> None:
     _heading("Bias correction: the first step is lr-sized whatever the gradient scale")
     for gradient_scale in (1e-6, 1.0, 1e3):
         parameter = {"w": np.zeros(1)}
-        optimizer = AdamW(parameter, lr=0.01)
-        optimizer.step({"w": np.array([gradient_scale])})
+        AdamW(parameter, lr=0.01).step({"w": np.array([gradient_scale])})
         print(f"  gradient {gradient_scale:>8.0e} -> first step {abs(float(parameter['w'])):.6f}")
     print(
         "\nAll three are lr, because mhat/sqrt(vhat) is +/-1 for a constant gradient. Without bias\n"
@@ -159,7 +163,7 @@ def cmd_optim(args) -> None:
         "zero and is a thousand times too small on step one."
     )
 
-    _heading("Schedule: linear warmup then cosine decay")
+    _heading("Schedule: linear warmup, then cosine decay to a floor")
     total = 100
     for step in (0, 4, 9, 10, 25, 50, 75, 99):
         print(f"  step {step:>3}: lr {cosine_schedule_with_warmup(step, total, 1e-3, 10):.3e}")
@@ -171,20 +175,24 @@ def cmd_optim(args) -> None:
 
 def cmd_tokenizer(args) -> None:
     """Byte-level BPE: compression, round-trips, no unknown tokens."""
+    from .tokenizer import BPETokenizer
+
     _heading("Byte-level BPE")
     text = demo.DEMO_TEXT
     for vocab_size in (256, 300, 400, 512):
         tokenizer = BPETokenizer.train(text, vocab_size)
-        n_tokens = len(tokenizer.encode(text))
         print(
-            f"  vocab {tokenizer.vocab_size:>4}  tokens {n_tokens:>6}  "
+            f"  vocab {tokenizer.vocab_size:>4}  tokens {len(tokenizer.encode(text)):>6}  "
             f"{tokenizer.compression_ratio(text):.2f} bytes/token"
         )
 
     tokenizer = BPETokenizer.train(text, 512)
     longest = sorted(tokenizer.vocab.values(), key=len, reverse=True)[:8]
-    print(f"\nlongest learned tokens: {[token.decode('utf-8', errors='replace') for token in longest]}")
-    print("Leading spaces stay attached to words, and no token spans a word boundary.")
+    print(
+        f"\nlongest learned tokens: "
+        f"{[token.decode('utf-8', errors='replace') for token in longest]}"
+    )
+    print("Leading spaces stay attached to their word, and no token spans a word boundary.")
 
     _heading("No input is out of vocabulary")
     for sample in [
@@ -195,8 +203,7 @@ def cmd_tokenizer(args) -> None:
         "",
     ]:
         ids = tokenizer.encode(sample)
-        restored = tokenizer.decode(ids)
-        status = "round-trips" if restored == sample else "LOST DATA"
+        status = "round-trips" if tokenizer.decode(ids) == sample else "LOST DATA"
         print(f"  {status}  {len(ids):>3} tokens  {sample[:40]!r}")
     print(
         "\nEvery one of these round-trips exactly, including text no merge was ever learned for,\n"
@@ -209,21 +216,23 @@ def cmd_sample(args) -> None:
     """Decoding knobs, and KV-cache equivalence."""
     _heading("Decoding: what each knob does to the same distribution")
     logits = np.log(np.array([[0.40, 0.25, 0.20, 0.10, 0.04, 0.01]]))
-    print("  base distribution:      [0.40 0.25 0.20 0.10 0.04 0.01]")
+    print("  base distribution:      [0.4  0.25 0.2  0.1  0.04 0.01]")
     for temperature in (0.5, 1.0, 2.0):
-        from .layers import softmax
-
         probabilities = softmax(logits / temperature, axis=-1)[0]
         print(f"  temperature {temperature:<4}        {np.round(probabilities, 3).tolist()}")
     print("  Below 1 sharpens, above 1 flattens. Applied to logits, not to probabilities.")
 
-    from .layers import softmax
-
-    print(f"\n  top-k=2 keeps:          {np.round(softmax(top_k_filter(logits, 2), -1)[0], 3).tolist()}")
-    print(f"  top-p=0.85 keeps:       {np.round(softmax(top_p_filter(logits, 0.85), -1)[0], 3).tolist()}")
     print(
-        "  Top-k always keeps two, whatever the shape. Top-p keeps as many as it takes to reach\n"
-        "  the mass, which is why it adapts to a peaked context and a flat one differently."
+        f"\n  top-k=2 keeps:          "
+        f"{np.round(softmax(top_k_filter(logits, 2), axis=-1)[0], 3).tolist()}"
+    )
+    print(
+        f"  top-p=0.9 keeps:        "
+        f"{np.round(softmax(top_p_filter(logits, 0.9), axis=-1)[0], 3).tolist()}"
+    )
+    print(
+        "  Top-k always keeps two, whatever the shape of the distribution. Top-p keeps as many as\n"
+        "  it takes to reach the mass, so it adapts to a peaked context and a flat one differently."
     )
 
     _heading("KV cache: same tokens, less work")
@@ -248,7 +257,7 @@ def cmd_train(args) -> None:
     tokenizer, dataset = demo.demo_dataset()
     config = ModelConfig(vocab_size=256, block_size=32, n_layer=2, n_head=4, n_embd=64, dropout=0.0)
     model = TransformerLM(config, seed=0)
-    print(f"{model.n_parameters():,} parameters, {len(dataset.tokens):,} training bytes")
+    print(f"{model.n_parameters():,} parameters, {len(dataset.tokens):,} bytes of text")
     print(f"uniform-baseline loss ln(256) = {uniform_loss(256):.3f}")
 
     started = time.perf_counter()
@@ -267,14 +276,14 @@ def cmd_train(args) -> None:
 
     prompt = "the gradient"
     ids = np.array([tokenizer.encode(prompt)])
-    out = generate(model, ids, 40, np.random.default_rng(0), temperature=0.8, top_k=20)
+    out = generate(model, ids, 20, np.random.default_rng(0), temperature=0.8, top_k=20)
     print(f"\nprompt:     {prompt!r}")
     print(f"generated:  {tokenizer.decode(out[0])!r}")
     print(
-        "\nA few thousand parameters on four kilobytes of text is not a language model; it is a\n"
-        "demonstration that the gradients and the optimiser work. The held-out loss falling below\n"
-        "ln(256) is the honest claim here, and the sample is worth exactly as much as its size\n"
-        "suggests."
+        "\nA few thousand parameters trained on four kilobytes of text is not a language model; it\n"
+        "is a demonstration that the gradients and the optimiser work. The held-out loss falling\n"
+        "below ln(256) is the honest claim here, and the sample is worth exactly as much as its\n"
+        "size suggests."
     )
 
 

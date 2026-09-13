@@ -5,6 +5,7 @@ import pytest
 
 from minigpt import demo
 from minigpt.gradcheck import check_module
+from minigpt.layers import cross_entropy
 from minigpt.model import Block, ModelConfig, TransformerLM
 from minigpt.train import uniform_loss
 
@@ -14,9 +15,8 @@ def test_every_model_gradient_matches_finite_differences():
 
     ``tok_emb.W`` receives gradient from two places: the embedding lookup on the way in and the
     output projection on the way out. If :class:`minigpt.layers.Module` assigned instead of
-    accumulating, this parameter's gradient would be wrong by roughly a factor of two while every
-    other parameter stayed correct -- and the model would still train, just worse. Nothing but a
-    numerical check finds that.
+    accumulating, this parameter's gradient would be wrong while every other parameter stayed
+    correct -- and the model would still train, just worse. Nothing but a numerical check finds that.
     """
     model = demo.tiny_model()
     x, y = demo.random_batch(model.config)
@@ -32,10 +32,36 @@ def test_every_model_gradient_matches_finite_differences():
 
 def test_the_tied_embedding_is_actually_checked():
     """Guard against the check above passing vacuously."""
-    model = demo.tiny_model()
-    names = [name for name, _ in model.named_parameters()]
+    names = [name for name, _ in demo.tiny_model().named_parameters()]
     assert "tok_emb.W" in names
     assert "pos_emb" in names
+
+
+def test_the_tied_gradient_is_the_sum_of_both_paths():
+    """Decompose the embedding gradient and show the lookup contribution is really there.
+
+    The output-projection term is ``dlogits^T @ h``, which is dense across the whole vocabulary. The
+    lookup term is a scatter-add, so it is non-zero only on the rows for tokens that actually
+    appeared in the batch. Subtracting the first from the total must therefore leave a matrix with
+    exactly that sparsity pattern -- which it cannot if one path overwrote the other.
+    """
+    model = demo.tiny_model()
+    x, y = demo.random_batch(model.config, batch_size=2, seed=9)
+    vocab, channels = model.config.vocab_size, model.config.n_embd
+
+    logits = model.forward(x)
+    _, dlogits = cross_entropy(logits.reshape(-1, vocab), np.asarray(y).reshape(-1))
+    output_path = dlogits.T @ model._final_hidden.reshape(-1, channels)
+
+    model.zero_grad()
+    model.backward(dlogits.reshape(logits.shape))
+    lookup_path = model.tok_emb.grads["W"] - output_path
+
+    used = np.unique(np.asarray(x))
+    unused = np.setdiff1d(np.arange(vocab), used)
+    assert np.any(lookup_path[used] != 0.0), "the lookup path contributed nothing"
+    assert np.allclose(lookup_path[unused], 0.0, atol=1e-12), "unused rows got lookup gradient"
+    assert np.any(output_path != 0.0)
 
 
 def test_loss_at_initialisation_is_log_vocab_size():
@@ -48,8 +74,7 @@ def test_loss_at_initialisation_is_log_vocab_size():
         config = demo.tiny_config(vocab_size=vocab_size)
         model = TransformerLM(config, seed=0).eval()
         x, y = demo.random_batch(config, batch_size=4)
-        loss = model.loss(x, y)
-        assert abs(loss - uniform_loss(vocab_size)) < 0.1 * uniform_loss(vocab_size)
+        assert abs(model.loss(x, y) - uniform_loss(vocab_size)) < 0.1 * uniform_loss(vocab_size)
 
 
 def test_parameter_count_matches_the_arithmetic():
@@ -58,19 +83,18 @@ def test_parameter_count_matches_the_arithmetic():
     For V=256, C=16, T=8, L=2:
       embedding      256*16 = 4096
       positions        8*16 =  128
-      per block:  2 LayerNorms 2*(16+16) = 64
-                  qkv    16*48 + 48      = 816
-                  proj   16*16 + 16      = 272
-                  fc     16*64 + 64      = 1088
-                  mlp proj 64*16 + 16    = 1040     -> 3280
-      two blocks                          = 6560
-      final LayerNorm                     =   32
-                                            -----
-                                            10816
+      per block:  two LayerNorms 2*(16+16) =   64
+                  qkv           16*48 + 48 =  816
+                  attn proj     16*16 + 16 =  272
+                  mlp fc        16*64 + 64 = 1088
+                  mlp proj      64*16 + 16 = 1040   -> 3280
+      two blocks                                    = 6560
+      final LayerNorm                                =   32
+                                                       -----
+                                                       10816
     An untied model would carry another 4096 parameters for a separate output head.
     """
-    model = demo.tiny_model()
-    assert model.n_parameters() == 10816
+    assert demo.tiny_model().n_parameters() == 10816
 
 
 def test_forward_shapes_and_limits():
@@ -79,7 +103,7 @@ def test_forward_shapes_and_limits():
     logits = model.forward(x)
     assert logits.shape == (x.shape[0], x.shape[1], model.config.vocab_size)
 
-    with pytest.raises(ValueError, match="exceeds the block size"):
+    with pytest.raises(ValueError, match="exceeds block size"):
         model.forward(np.zeros((1, model.config.block_size + 1), dtype=int))
     with pytest.raises(ValueError, match="shape"):
         model.forward(np.zeros(4, dtype=int))
@@ -89,11 +113,8 @@ def test_a_short_sequence_only_touches_the_positions_it_used():
     """Position embeddings beyond the sequence length must receive no gradient."""
     model = demo.tiny_model()
     used = 3
-    x = np.zeros((1, used), dtype=int)
-    y = np.ones((1, used), dtype=int)
-
     model.zero_grad()
-    model.loss_and_backward(x, y)
+    model.loss_and_backward(np.zeros((1, used), dtype=int), np.ones((1, used), dtype=int))
     assert np.any(model.grads["pos_emb"][:used] != 0.0)
     assert np.all(model.grads["pos_emb"][used:] == 0.0)
 
@@ -106,17 +127,15 @@ def test_no_parameter_is_left_without_gradient():
     model.loss_and_backward(x, y)
 
     for name, gradient in model.named_gradients():
-        if name == "pos_emb":
-            continue  # only the used prefix is expected to be non-zero
         assert np.any(gradient != 0.0), f"{name} received no gradient"
 
 
 def test_gradient_reaches_the_first_block_undiminished():
     """What the pre-LN residual path is for.
 
-    With a clean identity skip from the loss to the embedding, the first block's gradients are the
-    same order of magnitude as the last block's. A vanishing ratio here is the signature of a
-    residual path that has been normalised or scaled somewhere it should not have been.
+    With a clean identity skip from the loss down to the embedding, the first block's gradients are
+    the same order of magnitude as the last block's. A vanishing ratio here is the signature of a
+    residual path that has been normalised or rescaled somewhere it should not have been.
     """
     config = demo.tiny_config(n_layer=4)
     model = TransformerLM(config, seed=0)
@@ -170,7 +189,7 @@ def test_eval_mode_propagates_and_makes_the_forward_deterministic():
 def test_cached_generation_path_matches_the_full_forward():
     """Model level, not just attention level: this also exercises absolute positions.
 
-    Reusing position 0 for every step is a plausible bug that produces fluent-looking output with no
+    Reusing position 0 at every step is a plausible bug that produces fluent-looking output with no
     sense of order, and it is invisible by eye.
     """
     model = demo.tiny_model(n_embd=32).eval()
@@ -205,19 +224,17 @@ def test_config_validation():
 def test_block_backward_keeps_the_identity_path():
     """``dx = dout + branch`` -- forgetting the first term stops the deepest layers learning.
 
-    With both branch parameters frozen at zero output, the block is the identity and its input
-    gradient must be exactly the incoming gradient.
+    With both branch projections zeroed the block is exactly the identity, so its input gradient
+    must be exactly the incoming gradient.
     """
     config = demo.tiny_config()
     block = Block(config, np.random.default_rng(0))
-    block.attn.proj.params["W"][:] = 0.0
-    block.attn.proj.params["b"][:] = 0.0
-    block.mlp.proj.params["W"][:] = 0.0
-    block.mlp.proj.params["b"][:] = 0.0
+    for projection in (block.attn.proj, block.mlp.proj):
+        projection.params["W"][:] = 0.0
+        projection.params["b"][:] = 0.0
 
     x = np.random.default_rng(1).normal(size=(1, 4, config.n_embd))
-    out = block.forward(x)
-    assert np.allclose(out, x)
+    assert np.allclose(block.forward(x), x)
 
     dout = np.random.default_rng(2).normal(size=x.shape)
     assert np.allclose(block.backward(dout), dout)
